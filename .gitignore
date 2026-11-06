@@ -108,3 +108,24 @@ yolo11n.pt
 .pub/
 build/
 .flutter/
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets and databases
+.env
+.env.*
+**/users.db
+*.sqlite3
+
+# Flutter generated files
+**/.dart_tool/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+
+# OS files
+.DS_Store
+Thumbs.db
