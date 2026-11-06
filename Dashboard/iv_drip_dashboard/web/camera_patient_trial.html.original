@@ -1,0 +1,223 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IV Drip Monitoring - Patient Camera</title>
+  <style>
+    body{font-family:Arial,sans-serif;max-width:980px;margin:24px auto;padding:0 16px;color:#222}
+    h2{margin-bottom:8px} .row{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}
+    label{display:flex;flex-direction:column;gap:5px;flex:1;min-width:220px}
+    input{padding:10px;border:1px solid #bbb;border-radius:6px;font-size:15px}
+    button{padding:10px 16px;margin:8px 8px 8px 0;cursor:pointer}
+    video{width:100%;max-height:480px;background:#111;border-radius:8px}
+    #status{padding:10px;background:#f1f1f1;border-radius:6px;white-space:pre-wrap;margin-top:12px}
+    #result{font-size:21px;font-weight:bold;margin-top:14px}
+    .note{color:#555;font-size:13px}
+  </style>
+</head>
+<body>
+  <h2>IV Drip Monitoring - Patient Camera</h2>
+  <p class="note">Temporary laptop-camera input. Predictions are saved to the selected patient's readings. Raspberry Pi camera integration is not changed.</p>
+
+  <div class="row">
+    <label>Patient ID<input id="patientId" placeholder="Example: IVP002" autocomplete="off"></label>
+    <label>Patient device key<input id="deviceKey" type="password" placeholder="Paste the generated device key" autocomplete="off"></label>
+  </div>
+
+  <video id="video" autoplay playsinline muted></video>
+
+  <div>
+    <button id="startBtn">Start monitoring</button>
+    <button id="stopBtn" disabled>Stop monitoring</button>
+    <button id="predictBtn" disabled>Predict and save now</button>
+  </div>
+
+  <div id="status">Status: Enter a patient ID and device key, then start monitoring.</div>
+  <div id="result">Latest prediction: Waiting</div>
+  <p class="note">A prediction is requested and saved every five seconds. Keep this page open while monitoring.</p>
+
+  <canvas id="canvas" hidden></canvas>
+
+<script>
+  const API_BASE = 'http://127.0.0.1:8000';
+
+  const LEVELS = {
+    'sal_data_100': '100%',
+    'sal_data_80': '80%',
+    'sal_data_50': '50%',
+    'sal_data_empty': 'Empty'
+  };
+
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const statusBox = document.getElementById('status');
+  const resultBox = document.getElementById('result');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const predictBtn = document.getElementById('predictBtn');
+  // Automatically get the patient ID passed by the nurse dashboard.
+  const params = new URLSearchParams(window.location.search);
+  const patientFromDashboard = params.get('patientId');
+
+  if (patientFromDashboard) {
+    document.getElementById('patientId').value = patientFromDashboard;
+  }
+  
+
+  let stream = null;
+  let timer = null;
+  let busy = false;
+
+  function status(message) {
+    statusBox.textContent = 'Status: ' + message;
+  }
+
+  async function startCamera() {
+    const patientId = document.getElementById('patientId').value.trim();
+    const deviceKey = document.getElementById('deviceKey').value.trim();
+
+    if (!patientId || !deviceKey) {
+      status('Enter both the patient ID and its device key first.');
+      return;
+    }
+
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Camera access unavailable. Open this page through localhost in Chrome.');
+      }
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {width: {ideal: 1280}, height: {ideal: 720}},
+        audio: false
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      predictBtn.disabled = false;
+
+      status('Camera connected. Capturing and saving patient readings every five seconds.');
+
+      await predictAndSave();
+      timer = setInterval(predictAndSave, 5000);
+
+    } catch (e) {
+      status(e.message || String(e));
+      stopCamera();
+    }
+  }
+
+  function stopCamera() {
+    if (timer) clearInterval(timer);
+    timer = null;
+
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    video.srcObject = null;
+
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    predictBtn.disabled = true;
+
+    status('Monitoring stopped.');
+  }
+
+  async function predictAndSave() {
+    if (!stream || busy || !video.videoWidth) return;
+
+    busy = true;
+
+    try {
+      const patientId = document.getElementById('patientId').value.trim();
+      const deviceKey = document.getElementById('deviceKey').value.trim();
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      canvas.getContext('2d').drawImage(
+        video, 0, 0, canvas.width, canvas.height
+      );
+
+      const blob = await new Promise(resolve =>
+        canvas.toBlob(resolve, 'image/jpeg', 0.9)
+      );
+
+      if (!blob) throw new Error('Could not capture a camera frame.');
+
+      const form = new FormData();
+      form.append('file', blob, 'webcam_frame.jpg');
+
+      const predictionResponse = await fetch(
+        API_BASE + '/api/predict',
+        {method: 'POST', body: form}
+      );
+
+      const prediction = await predictionResponse.json();
+
+      if (!predictionResponse.ok) {
+        throw new Error(prediction.detail || 'Prediction failed.');
+      }
+
+      // Convert the model's internal class into the backend's accepted label.
+      const modelLabel = String(prediction.label).trim();
+      const label = LEVELS[modelLabel];
+
+      if (!label) {
+        throw new Error('Unknown model label: ' + modelLabel);
+      }
+
+      const confidence = Number(prediction.confidence);
+
+      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+        throw new Error('Invalid prediction confidence returned by backend.');
+      }
+
+      const saveResponse = await fetch(
+        API_BASE + '/api/patients/' + encodeURIComponent(patientId) + '/readings',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Device-Key': deviceKey
+          },
+          body: JSON.stringify({
+            level_label: label,
+            confidence: confidence
+          })
+        }
+      );
+
+      const saved = await saveResponse.json();
+
+      if (!saveResponse.ok) {
+        throw new Error(saved.detail || 'Prediction was made but saving failed.');
+      }
+
+      resultBox.textContent =
+        'Latest prediction: ' + label +
+        ' | Confidence: ' + (confidence * 100).toFixed(1) + '%';
+
+      status(
+        'Saved for ' + patientId +
+        ' at ' + new Date().toLocaleTimeString() +
+        (label === 'Empty' ? ' | EMPTY-FLUID WARNING' : '') + '.'
+      );
+
+    } catch (e) {
+      status(e.message || String(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', stopCamera);
+  predictBtn.addEventListener('click', predictAndSave);
+  window.addEventListener('beforeunload', stopCamera);
+</script>
+</body>
+</html>

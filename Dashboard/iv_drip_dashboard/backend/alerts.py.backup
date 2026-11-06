@@ -1,0 +1,431 @@
+"""
+alerts.py - Automatic Empty-Fluid Detection, Alert Management & Notifications
+
+Handles:
+1. Database table 'alerts' creation and lifecycle management.
+2. Configurable confirmation threshold for 'Empty' IV fluid detection.
+3. Anti-duplicate tracking (prevents spamming alerts during continuous empty state,
+   resets when fluid is replenished).
+4. Dual notification dispatch: Email (SMTP) and SMS (Twilio/provider).
+5. Error resilience: notification failures are recorded without crashing the application.
+6. Role-based API routes for listing, acknowledging, and resolving alerts.
+"""
+
+from datetime import datetime, timezone
+from pathlib import Path
+import email.message
+import json
+import logging
+import os
+import smtplib
+import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+
+from auth import get_current_user
+
+logger = logging.getLogger("iv_alerts")
+
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = BASE_DIR / "users.db"
+
+router = APIRouter(prefix="/api/alerts", tags=["Alerts"])
+
+# Configuration via environment variables
+EMPTY_CONFIRMATION_THRESHOLD = int(os.getenv("IV_EMPTY_CONFIRMATION_COUNT", "2"))
+
+# In-memory tracking of consecutive empty readings per patient
+_consecutive_empty_counts = {}
+
+
+def get_connection():
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_alerts_database():
+    """Initializes the alerts table in SQLite."""
+    with get_connection() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id TEXT NOT NULL,
+                nurse_id INTEGER,
+                patient_name TEXT,
+                bed_number TEXT,
+                alert_type TEXT NOT NULL DEFAULT 'IV_EMPTY',
+                fluid_level TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('new', 'acknowledged', 'resolved')),
+                email_status TEXT DEFAULT 'not_configured',
+                sms_status TEXT DEFAULT 'not_configured',
+                created_at TEXT NOT NULL,
+                acknowledged_at TEXT,
+                acknowledged_by INTEGER,
+                resolved_at TEXT,
+                resolved_by INTEGER,
+                FOREIGN KEY (nurse_id) REFERENCES users(id)
+            )
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alerts_nurse_status
+            ON alerts (nurse_id, status)
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alerts_patient_status
+            ON alerts (patient_id, status)
+        """)
+
+
+def send_email_notification(
+    recipient_email: str,
+    nurse_name: str,
+    patient_name: str,
+    patient_id: str,
+    bed_number: str,
+    detected_at: str,
+) -> str:
+    """
+    Sends an automated email alert via SMTP if credentials are configured in environment.
+    Returns status string: 'sent', 'skipped (...)', or 'failed (...)'.
+    """
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    smtp_from = os.getenv("SMTP_FROM", smtp_user or "alerts@ivdrip.local")
+    use_tls = os.getenv("SMTP_USE_TLS", "true").lower() in ("true", "1", "yes")
+
+    if not smtp_host or not smtp_user or not smtp_password:
+        return "skipped (SMTP credentials not configured in environment)"
+
+    if not recipient_email:
+        return "skipped (Nurse has no email address)"
+
+    subject = f"URGENT: IV Saline Container EMPTY - Patient {patient_name} (Bed {bed_number})"
+    body = f"""Dear Nurse {nurse_name},
+
+AUTOMATED CLINICAL MONITORING ALERT
+
+This is an automated notification from the IV Fluid Monitoring System.
+
+Patient Details:
+- Patient Name: {patient_name}
+- Patient ID:   {patient_id}
+- Bed Number:   {bed_number}
+- Status:       IV FLUID EMPTY (0% detected)
+- Alert Time:   {detected_at}
+
+ACTION REQUIRED:
+Please attend to the patient immediately to inspect the IV infusion line and replace the fluid container.
+
+Notice:
+This automated alert is a clinical workflow support notification based on computer vision analysis.
+It is intended to support timely attention and does not replace regular direct observation by nursing staff.
+"""
+
+    try:
+        msg = email.message.EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = smtp_from
+        msg["To"] = recipient_email
+        msg.set_content(body)
+
+        if use_tls:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+
+        return f"sent to {recipient_email}"
+    except Exception as exc:
+        logger.warning(f"Email notification delivery failed: {exc}")
+        return f"failed: {str(exc)}"
+
+
+def send_sms_notification(
+    recipient_phone: Optional[str],
+    patient_name: str,
+    patient_id: str,
+    bed_number: str,
+) -> str:
+    """
+    Sends an automated SMS alert via Twilio REST API if configured in environment.
+    Returns status string: 'sent', 'skipped (...)', or 'failed (...)'.
+    """
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_FROM_NUMBER")
+
+    if not account_sid or not auth_token or not from_number:
+        return "skipped (Twilio credentials not configured in environment)"
+
+    phone = recipient_phone or os.getenv("DEFAULT_ALERT_PHONE")
+    if not phone:
+        return "skipped (No recipient phone number registered)"
+
+    message_body = (
+        f"URGENT: IV Fluid EMPTY for {patient_name} (ID: {patient_id}, Bed: {bed_number}). "
+        f"Please attend to bed {bed_number} immediately."
+    )
+
+    try:
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+        data = urllib.parse.urlencode({
+            "From": from_number,
+            "To": phone,
+            "Body": message_body,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(url, data=data, method="POST")
+        # Basic authentication for Twilio
+        import base64
+        auth_header = base64.b64encode(f"{account_sid}:{auth_token}".encode("utf-8")).decode("ascii")
+        req.add_header("Authorization", f"Basic {auth_header}")
+
+        with urllib.request.urlopen(req, timeout=8) as response:
+            resp_data = json.loads(response.read().decode("utf-8"))
+            return f"sent (SID: {resp_data.get('sid', 'ok')})"
+    except Exception as exc:
+        logger.warning(f"SMS notification delivery failed: {exc}")
+        return f"failed: {str(exc)}"
+
+
+def evaluate_reading_for_alert(
+    patient_id: str,
+    level_label: str,
+    confidence: float,
+    captured_at: str,
+) -> Optional[dict]:
+    """
+    Evaluates incoming patient reading against empty confirmation threshold and anti-duplicate rules.
+    Called automatically on every reading submission.
+    """
+    global _consecutive_empty_counts
+
+    # If fluid is not empty (replenished: 50%, 80%, 100%), reset empty count
+    if level_label != "Empty":
+        _consecutive_empty_counts[patient_id] = 0
+        return None
+
+    # Increment consecutive empty count for this patient
+    count = _consecutive_empty_counts.get(patient_id, 0) + 1
+    _consecutive_empty_counts[patient_id] = count
+
+    # Require confirmation threshold before firing alert (reduces false alarms)
+    if count < EMPTY_CONFIRMATION_THRESHOLD:
+        return None
+
+    with get_connection() as connection:
+        # Check if an alert is already active (new or acknowledged) for this patient
+        existing_active = connection.execute("""
+            SELECT id, status FROM alerts
+            WHERE patient_id = ? AND status IN ('new', 'acknowledged')
+            ORDER BY id DESC LIMIT 1
+        """, (patient_id,)).fetchone()
+
+        if existing_active:
+            # Alert already active and not yet resolved; avoid duplicate alerts
+            return None
+
+        # Fetch patient & assigned nurse information
+        patient = connection.execute("""
+            SELECT p.patient_id, p.name AS patient_name, p.bed_number, p.assigned_nurse_id,
+                   u.name AS nurse_name, u.email AS nurse_email, u.phone AS nurse_phone
+            FROM patients p
+            LEFT JOIN users u ON p.assigned_nurse_id = u.id
+            WHERE p.patient_id = ?
+        """, (patient_id,)).fetchone()
+
+        if not patient:
+            return None
+
+        patient_name = patient["patient_name"]
+        bed_number = patient["bed_number"]
+        nurse_id = patient["assigned_nurse_id"]
+        nurse_name = patient["nurse_name"] or "Staff Nurse"
+        nurse_email = patient["nurse_email"]
+        nurse_phone = patient["nurse_phone"]
+
+        # Dispatch notifications (resilient, does not fail the process)
+        email_status = send_email_notification(
+            recipient_email=nurse_email,
+            nurse_name=nurse_name,
+            patient_name=patient_name,
+            patient_id=patient_id,
+            bed_number=bed_number,
+            detected_at=captured_at,
+        )
+
+        sms_status = send_sms_notification(
+            recipient_phone=nurse_phone,
+            patient_name=patient_name,
+            patient_id=patient_id,
+            bed_number=bed_number,
+        )
+
+        # Insert new confirmed alert record into database
+        cursor = connection.execute("""
+            INSERT INTO alerts (
+                patient_id, nurse_id, patient_name, bed_number,
+                alert_type, fluid_level, confidence, status,
+                email_status, sms_status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
+        """, (
+            patient_id,
+            nurse_id,
+            patient_name,
+            bed_number,
+            "IV_EMPTY",
+            level_label,
+            confidence,
+            email_status,
+            sms_status,
+            captured_at,
+        ))
+        alert_id = cursor.lastrowid
+
+        return {
+            "alert_id": alert_id,
+            "patient_id": patient_id,
+            "patient_name": patient_name,
+            "bed_number": bed_number,
+            "status": "new",
+            "email_status": email_status,
+            "sms_status": sms_status,
+        }
+
+
+# ---------------- API ROUTER ENDPOINTS ----------------
+
+@router.get("")
+def list_alerts(
+    status: Optional[str] = Query(None, description="Filter by status: new, acknowledged, resolved, or active"),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Lists alerts with role-based filtering:
+    - Admin: can view alerts across all patients.
+    - Nurse: can only view alerts for patients assigned to her.
+    """
+    with get_connection() as connection:
+        query = "SELECT * FROM alerts"
+        conditions = []
+        params = []
+
+        if current_user["role"] == "nurse":
+            conditions.append("nurse_id = ?")
+            params.append(current_user["id"])
+
+        if status:
+            if status == "active":
+                conditions.append("status IN ('new', 'acknowledged')")
+            elif status in ("new", "acknowledged", "resolved"):
+                conditions.append("status = ?")
+                params.append(status)
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        query += " ORDER BY id DESC LIMIT 50"
+        rows = connection.execute(query, params).fetchall()
+
+    return [dict(r) for r in rows]
+
+
+@router.put("/{alert_id}/acknowledge")
+def acknowledge_alert(
+    alert_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Marks an alert as acknowledged by the assigned nurse or admin."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as connection:
+        alert = connection.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+        if not alert:
+            raise HTTPException(status_code=404, detail="Alert not found")
+
+        if current_user["role"] == "nurse" and alert["nurse_id"] != current_user["id"]:
+            raise HTTPException(status_code=403, detail="This alert belongs to another nurse's patient")
+
+        connection.execute("""
+            UPDATE alerts
+            SET status = 'acknowledged', acknowledged_at = ?, acknowledged_by = ?
+            WHERE id = ?
+        """, (now, current_user["id"], alert_id))
+
+    return {"message": "Alert acknowledged successfully", "alert_id": alert_id, "status": "acknowledged"}
+
+
+@router.put("/{alert_id}/resolve")
+def resolve_alert(
+    alert_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Marks an alert as resolved after replacing the IV fluid."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as connection:
+        alert = connection.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+        if not alert:
+            raise HTTPException(status_code=404, detail="Alert not found")
+
+        if current_user["role"] == "nurse" and alert["nurse_id"] != current_user["id"]:
+            raise HTTPException(status_code=403, detail="This alert belongs to another nurse's patient")
+
+        connection.execute("""
+            UPDATE alerts
+            SET status = 'resolved', resolved_at = ?, resolved_by = ?
+            WHERE id = ?
+        """, (now, current_user["id"], alert_id))
+
+        # Reset in-memory empty count for this patient
+        _consecutive_empty_counts[alert["patient_id"]] = 0
+
+    return {"message": "Alert resolved successfully", "alert_id": alert_id, "status": "resolved"}
+
+
+class TestAlertRequest(BaseModel):
+    patient_id: str
+    confidence: Optional[float] = 0.95
+
+
+@router.post("/test")
+def trigger_test_alert(
+    data: TestAlertRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Triggers a test empty-fluid alert for a patient to verify in-dashboard,
+    email, and SMS notifications without waiting for camera prediction.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    # Force confirmation threshold for test
+    _consecutive_empty_counts[data.patient_id] = EMPTY_CONFIRMATION_THRESHOLD
+
+    result = evaluate_reading_for_alert(
+        patient_id=data.patient_id,
+        level_label="Empty",
+        confidence=data.confidence,
+        captured_at=now,
+    )
+    if not result:
+        return {
+            "message": "An active alert already exists for this patient or patient ID is invalid.",
+            "patient_id": data.patient_id,
+        }
+
+    return {
+        "message": "Test alert generated successfully",
+        "alert": result,
+    }

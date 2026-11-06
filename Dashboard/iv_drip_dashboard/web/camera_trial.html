@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IV Drip - Laptop Camera Trial</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; color: #222; }
+    h2 { margin-bottom: 6px; }
+    video { width: 100%; max-height: 480px; background: #111; border-radius: 8px; }
+    button { padding: 10px 16px; margin: 10px 8px 10px 0; cursor: pointer; }
+    #status { padding: 10px; background: #f1f1f1; border-radius: 6px; white-space: pre-wrap; }
+    #result { font-size: 20px; font-weight: bold; margin-top: 14px; }
+    .note { color: #555; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h2>IV Drip Detection - Laptop Webcam Trial</h2>
+  <p class="note">Temporary camera test only. It uses the existing backend prediction endpoint and does not modify your trained model or patient dashboard.</p>
+  <video id="video" autoplay playsinline muted></video>
+  <div>
+    <button id="startBtn">Start laptop camera</button>
+    <button id="stopBtn" disabled>Stop camera</button>
+    <button id="predictBtn" disabled>Predict now</button>
+  </div>
+  <div id="status">Status: Camera not started.</div>
+  <div id="result">Prediction: Waiting</div>
+  <p class="note">Automatic prediction interval: 5 seconds while the camera is running.</p>
+  <canvas id="canvas" hidden></canvas>
+
+<script>
+  // If your backend runs on another computer, change this to that computer's
+  // reachable address, for example http://192.168.x.x:8000.
+  const API_BASE = 'http://127.0.0.1:8000';
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const statusBox = document.getElementById('status');
+  const resultBox = document.getElementById('result');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const predictBtn = document.getElementById('predictBtn');
+  let stream = null;
+  let timer = null;
+  let busy = false;
+
+  function status(message) { statusBox.textContent = 'Status: ' + message; }
+
+  async function startCamera() {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Camera access is unavailable. Open this page through localhost in Chrome.');
+      }
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      predictBtn.disabled = false;
+      status('Laptop camera is running. Prediction will run every 5 seconds.');
+      await predictFrame();
+      timer = setInterval(predictFrame, 5000);
+    } catch (error) {
+      status(error.message || String(error));
+    }
+  }
+
+  function stopCamera() {
+    if (timer) clearInterval(timer);
+    timer = null;
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    stream = null;
+    video.srcObject = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    predictBtn.disabled = true;
+    status('Camera stopped.');
+  }
+
+  async function predictFrame() {
+    if (!stream || busy || video.videoWidth === 0) return;
+    busy = true;
+    try {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+      if (!blob) throw new Error('Could not capture a camera frame.');
+
+      const form = new FormData();
+      form.append('file', blob, 'webcam_frame.jpg');
+      const response = await fetch(API_BASE + '/api/predict', { method: 'POST', body: form });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Prediction request failed.');
+
+      const confidence = (Number(data.confidence) * 100).toFixed(1);
+      resultBox.textContent = `Prediction: ${data.label} | Confidence: ${confidence}%`;
+      status('Camera running. Last prediction: ' + new Date().toLocaleTimeString());
+    } catch (error) {
+      status('Prediction error: ' + (error.message || String(error)));
+    } finally {
+      busy = false;
+    }
+  }
+
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', stopCamera);
+  predictBtn.addEventListener('click', predictFrame);
+  window.addEventListener('beforeunload', stopCamera);
+</script>
+</body>
+</html>

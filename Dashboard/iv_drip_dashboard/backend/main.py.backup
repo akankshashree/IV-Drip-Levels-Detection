@@ -1,0 +1,161 @@
+from pathlib import Path
+import json
+import sys
+from datetime import datetime, timezone
+
+import numpy as np
+import tensorflow as tf
+from PIL import Image, ImageOps
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from patients import router as patients_router, initialize_patient_database
+from auth import router as auth_router, initialize_auth_database
+# Project paths
+
+ROOT = Path(__file__).resolve().parents[3]
+MODEL_PATH = ROOT / "models" / "mobilenetv2_iv.keras"
+LABELS_PATH = ROOT / "models" / "mobilenetv2_labels.json"
+
+IMAGE_SIZE = (224, 224)
+
+app = FastAPI(title="IV Drip Monitoring API", version="1.0.0")
+app.include_router(auth_router)
+app.include_router(patients_router)
+# Allow Flutter web dashboard to call this API during development.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Restrict this before production deployment.
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+model = None
+labels = None
+last_prediction = None
+
+
+def load_model_and_labels():
+    global model, labels
+
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+
+    if not LABELS_PATH.is_file():
+        raise FileNotFoundError(f"Labels not found: {LABELS_PATH}")
+
+    model = tf.keras.models.load_model(MODEL_PATH)
+
+    with LABELS_PATH.open("r", encoding="utf-8") as file:
+        labels = json.load(file)
+
+    if len(labels) != model.output_shape[-1]:
+        raise ValueError("Label count does not match model output count.")
+
+    if tuple(model.input_shape[1:]) != (224, 224, 3):
+        raise ValueError(f"Unexpected model input shape: {model.input_shape}")
+
+
+
+@app.on_event("startup")
+def startup():
+    initialize_auth_database()
+    initialize_patient_database()
+    load_model_and_labels()
+
+
+def preprocess_image(image):
+    image = ImageOps.exif_transpose(image)
+    image = image.convert("RGB")
+    image = image.resize(IMAGE_SIZE)
+
+    array = np.asarray(image, dtype=np.float32)
+    
+
+    return np.expand_dims(array, axis=0)
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "IV Drip Monitoring API",
+        "status": "online",
+    }
+
+
+@app.get("/api/status")
+def get_status():
+    return {
+        "api_status": "online",
+        "model_loaded": model is not None,
+        "last_prediction_time": (
+            last_prediction["timestamp"] if last_prediction else None
+        ),
+    }
+
+
+@app.post("/api/predict")
+async def predict(file: UploadFile = File(...)):
+    global last_prediction
+
+    if model is None or labels is None:
+        raise HTTPException(status_code=503, detail="Model is not loaded.")
+
+    try:
+        contents = await file.read()
+
+        if not contents:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty."
+            )
+
+        from io import BytesIO
+
+        try:
+            image = Image.open(BytesIO(contents))
+            image.verify()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is not a valid image."
+            )
+
+        # Reopen after verify(), because verify() invalidates the image object
+        image = Image.open(BytesIO(contents))
+
+        batch = preprocess_image(image)
+        scores = model.predict(batch, verbose=0)[0]
+
+        if not np.all(np.isfinite(scores)):
+            raise ValueError("Model returned invalid scores.")
+
+        index = int(np.argmax(scores))
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        result = {
+            "label": labels[index],
+            "confidence": float(scores[index]),
+            "scores": {
+                label: float(score)
+                for label, score in zip(labels, scores)
+            },
+            "timestamp": timestamp,
+        }
+
+        last_prediction = result
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction failed: {str(exc)}",
+        )
+
+@app.get("/api/prediction")
+def get_last_prediction():
+    if last_prediction is None:
+        return {"message": "No prediction available yet."}
+    return last_prediction

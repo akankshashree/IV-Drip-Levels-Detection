@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IV Drip Monitoring - Patient Webcam</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 960px; margin: 24px auto; padding: 0 16px; color: #1e293b; background: #f8fafc; }
+    h2 { margin-bottom: 6px; color: #0f766e; }
+    .header-desc { color: #64748b; font-size: 14px; margin-bottom: 18px; }
+    .row { display: flex; gap: 14px; flex-wrap: wrap; margin: 12px 0; align-items: flex-end; }
+    label { display: flex; flex-direction: column; gap: 5px; flex: 1; min-width: 220px; font-weight: 600; font-size: 14px; }
+    input, select { padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 15px; outline: none; background: #fff; }
+    input:focus, select:focus { border-color: #0f766e; box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.2); }
+    .session-badge { display: inline-flex; align-items: center; gap: 6px; padding: 10px 14px; background: #e6fffa; border: 1px solid #99f6e4; color: #0d9488; border-radius: 6px; font-size: 13px; font-weight: 600; }
+    .btn-row { display: flex; gap: 10px; margin: 14px 0; flex-wrap: wrap; }
+    button { padding: 10px 18px; cursor: pointer; border: none; border-radius: 6px; font-weight: 600; font-size: 14px; transition: all 0.15s ease-in-out; }
+    #startBtn { background: #0f766e; color: #fff; }
+    #startBtn:hover:not(:disabled) { background: #115e59; }
+    #stopBtn { background: #e2e8f0; color: #334155; }
+    #stopBtn:hover:not(:disabled) { background: #cbd5e1; }
+    #predictBtn { background: #0284c7; color: #fff; }
+    #predictBtn:hover:not(:disabled) { background: #0369a1; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .video-container { position: relative; width: 100%; max-height: 480px; background: #000; border-radius: 8px; overflow: hidden; display: flex; justify-content: center; align-items: center; }
+    video { width: 100%; max-height: 480px; object-fit: contain; }
+    #status { padding: 12px 14px; background: #f1f5f9; border-left: 4px solid #0f766e; border-radius: 4px; font-size: 14px; margin-top: 14px; color: #334155; }
+    #status.alert { background: #fef2f2; border-left-color: #ef4444; color: #991b1b; font-weight: bold; }
+    #result { font-size: 20px; font-weight: bold; margin-top: 14px; color: #0f172a; }
+    .note { color: #64748b; font-size: 13px; margin-top: 10px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h2>IV Drip Monitoring — Laptop Webcam (Demonstration Mode)</h2>
+  <p class="header-desc">
+    Demonstration camera input for presenting to the evaluation panel. Images are captured, classified with MobileNetV2, and saved to the patient record at configurable intervals (5s default, 10s option).
+  </p>
+
+  <div class="row">
+    <label>
+      Patient ID
+      <input id="patientId" placeholder="Example: IVP002" autocomplete="off">
+    </label>
+    <label>
+      Demonstration Capture Interval
+      <select id="intervalSelect">
+        <option value="5000" selected>5 seconds (Fast Demonstration - Default)</option>
+        <option value="10000">10 seconds (Standard Demonstration)</option>
+      </select>
+    </label>
+    <div class="session-badge" id="authBadge">
+      &#10003; Nurse Session Authenticated (Demonstration Mode)
+    </div>
+  </div>
+
+  <div class="video-container">
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+
+  <div class="btn-row">
+    <button id="startBtn">Start monitoring</button>
+    <button id="stopBtn" disabled>Stop monitoring</button>
+    <button id="predictBtn" disabled>Predict now</button>
+  </div>
+
+  <div id="status">Status: Click "Start monitoring" to begin automated IV level detection.</div>
+  <div id="result">Latest prediction: Waiting</div>
+
+  <p class="note">
+    <strong>Notice:</strong> This automated monitoring system is an auxiliary clinical aid. Predictions support timely nursing attention and do not replace direct observation by trained healthcare staff.
+  </p>
+
+  <canvas id="canvas" hidden></canvas>
+
+<script>
+  // Dynamically resolve API base from current window location
+  const API_BASE = (window.location.protocol.startsWith('http') && window.location.hostname)
+    ? `${window.location.protocol}//${window.location.hostname}:8000`
+    : 'http://127.0.0.1:8000';
+
+  const LEVELS = {
+    'sal_data_100': '100%',
+    'sal_data_80': '80%',
+    'sal_data_50': '50%',
+    'sal_data_empty': 'Empty'
+  };
+
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const statusBox = document.getElementById('status');
+  const resultBox = document.getElementById('result');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const predictBtn = document.getElementById('predictBtn');
+  const authBadge = document.getElementById('authBadge');
+  const intervalSelect = document.getElementById('intervalSelect');
+
+  let currentIntervalMs = parseInt(intervalSelect?.value, 10) || 5000;
+
+  if (intervalSelect) {
+    intervalSelect.addEventListener('change', () => {
+      currentIntervalMs = parseInt(intervalSelect.value, 10) || 5000;
+      if (timer) {
+        clearInterval(timer);
+        timer = setInterval(predictAndSave, currentIntervalMs);
+        setStatus(`Demonstration active. Interval updated to ${currentIntervalMs / 1000} seconds.`);
+      }
+    });
+  }
+
+  // Query parameters passed from the Nurse Dashboard
+  const params = new URLSearchParams(window.location.search);
+  const patientFromDashboard = params.get('patientId');
+  let nurseToken = params.get('token');
+
+  // Store token in sessionStorage for session continuity
+  if (nurseToken) {
+    sessionStorage.setItem('iv_nurse_token', nurseToken);
+  } else {
+    nurseToken = sessionStorage.getItem('iv_nurse_token') || '';
+  }
+
+  if (patientFromDashboard) {
+    document.getElementById('patientId').value = patientFromDashboard;
+  }
+
+  if (!nurseToken) {
+    authBadge.textContent = '! No session token detected (launch from dashboard for full authorization)';
+    authBadge.style.color = '#b45309';
+    authBadge.style.background = '#fef3c7';
+    authBadge.style.borderColor = '#fde68a';
+  }
+
+  let stream = null;
+  let timer = null;
+  let busy = false;
+
+  function setStatus(message, isAlert = false) {
+    statusBox.textContent = 'Status: ' + message;
+    if (isAlert) {
+      statusBox.className = 'alert';
+    } else {
+      statusBox.className = '';
+    }
+  }
+
+  async function startCamera() {
+    const patientId = document.getElementById('patientId').value.trim();
+
+    if (!patientId) {
+      setStatus('Please enter or verify the Patient ID first.');
+      return;
+    }
+
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Camera access unavailable. Open this page through localhost or HTTPS in Chrome.');
+      }
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      predictBtn.disabled = false;
+
+      currentIntervalMs = parseInt(intervalSelect?.value, 10) || 5000;
+      setStatus(`Demonstration active. Capturing and saving IV fluid readings every ${currentIntervalMs / 1000} seconds.`);
+
+      await predictAndSave();
+      timer = setInterval(predictAndSave, currentIntervalMs);
+
+    } catch (e) {
+      setStatus(e.message || String(e));
+      stopCamera();
+    }
+  }
+
+  function stopCamera() {
+    if (timer) clearInterval(timer);
+    timer = null;
+
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    video.srcObject = null;
+
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    predictBtn.disabled = true;
+
+    setStatus('Monitoring stopped.');
+  }
+
+  async function predictAndSave() {
+    if (!stream || busy || !video.videoWidth) return;
+
+    busy = true;
+
+    try {
+      const patientId = document.getElementById('patientId').value.trim();
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      canvas.getContext('2d').drawImage(
+        video, 0, 0, canvas.width, canvas.height
+      );
+
+      const blob = await new Promise(resolve =>
+        canvas.toBlob(resolve, 'image/jpeg', 0.85)
+      );
+
+      if (!blob) throw new Error('Could not capture a camera frame.');
+
+      // 1. Send frame to FastAPI /api/predict
+      const form = new FormData();
+      form.append('file', blob, 'webcam_frame.jpg');
+
+      const predictionResponse = await fetch(
+        API_BASE + '/api/predict',
+        { method: 'POST', body: form }
+      );
+
+      const prediction = await predictionResponse.json();
+
+      if (!predictionResponse.ok) {
+        throw new Error(prediction.detail || 'Prediction failed.');
+      }
+
+      const modelLabel = String(prediction.label).trim();
+      const label = LEVELS[modelLabel];
+
+      if (!label) {
+        throw new Error('Unknown model label: ' + modelLabel);
+      }
+
+      const confidence = Number(prediction.confidence);
+
+      // 2. Submit reading to /api/patients/{id}/readings using nurse session authorization
+      const headers = { 'Content-Type': 'application/json' };
+      if (nurseToken) {
+        headers['Authorization'] = 'Bearer ' + nurseToken;
+      }
+
+      const queryParam = nurseToken ? ('?token=' + encodeURIComponent(nurseToken)) : '';
+      const intervalSec = Math.round(currentIntervalMs / 1000);
+      const saveResponse = await fetch(
+        API_BASE + '/api/patients/' + encodeURIComponent(patientId) + '/readings' + queryParam,
+        {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({
+            level_label: label,
+            confidence: confidence,
+            capture_interval: intervalSec
+          })
+        }
+      );
+
+      const saved = await saveResponse.json();
+
+      if (!saveResponse.ok) {
+        throw new Error(saved.detail || 'Saving reading failed.');
+      }
+
+      resultBox.textContent =
+        'Latest prediction: ' + label +
+        ' | Confidence: ' + (confidence * 100).toFixed(1) + '% (Interval: ' + intervalSec + 's)';
+
+      if (label === 'Empty') {
+        const alertNote = saved.alert
+          ? ` | AUTOMATED ALERT GENERATED (Email: ${saved.alert.email_status})`
+          : ' | EMPTY LEVEL DETECTED';
+        setStatus(`Saved for ${patientId} at ${new Date().toLocaleTimeString()} [Demo ${intervalSec}s]${alertNote}`, true);
+      } else {
+        setStatus(`Saved for ${patientId} at ${new Date().toLocaleTimeString()} [Demo ${intervalSec}s] (Level: ${label}).`);
+      }
+
+    } catch (e) {
+      setStatus(e.message || String(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', stopCamera);
+  predictBtn.addEventListener('click', predictAndSave);
+  window.addEventListener('beforeunload', stopCamera);
+</script>
+</body>
+</html>

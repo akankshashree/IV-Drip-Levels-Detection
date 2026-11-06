@@ -1,0 +1,170 @@
+
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+
+class AuthService {
+  static const String baseUrl = 'http://127.0.0.1:8000';
+
+  static Future<Map<String, dynamic>> login(
+    String email,
+    String password,
+  ) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/auth/login'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'email': email,
+        'password': password,
+      }),
+    );
+
+    final data = jsonDecode(response.body);
+
+    if (response.statusCode == 200) {
+      return data;
+    }
+
+    throw Exception(data['detail'] ?? 'Login failed');
+  }
+
+  static Future<Map<String, dynamic>> getProfile(String token) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/api/auth/me'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+
+    final data = jsonDecode(response.body);
+
+    if (response.statusCode == 200) {
+      return data;
+    }
+
+    throw Exception(data['detail'] ?? 'Could not fetch profile');
+  }
+
+  static Future<void> createNurse(
+    String token,
+    String name,
+    String email,
+    String password,
+  ) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/auth/register'),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $token',
+      },
+      body: jsonEncode({
+        'name': name,
+        'email': email,
+        'password': password,
+        'role': 'nurse',
+      }),
+    );
+
+    if (response.statusCode != 200) {
+      final data = jsonDecode(response.body);
+      throw Exception(data['detail'] ?? 'Could not create nurse account');
+    }
+  }
+  static Future<void> createPatient(
+  String token,
+  String patientId,
+  String name,
+  String bedNumber,
+) async {
+  final response = await http.post(
+    Uri.parse('$baseUrl/api/patients'),
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer $token',
+    },
+    body: jsonEncode({
+      'patient_id': patientId,
+      'name': name,
+      'bed_number': bedNumber,
+    }),
+  );
+
+  if (response.statusCode != 200) {
+    final data = jsonDecode(response.body);
+    throw Exception(data['detail'] ?? 'Could not register patient');
+  }
+}
+
+static Future<List<dynamic>> getPatients(String token) async {
+  final response = await http.get(
+    Uri.parse('$baseUrl/api/patients'),
+    headers: {
+      'Authorization': 'Bearer $token',
+    },
+  );
+
+  final data = jsonDecode(response.body);
+
+  if (response.statusCode == 200) {
+    return data;
+  }
+
+  throw Exception(data['detail'] ?? 'Could not load patients');
+}
+static Future<List<dynamic>> getNurses(String token) async {
+  final response = await http.get(
+    Uri.parse('$baseUrl/api/patients/nurses'),
+    headers: {
+      'Authorization': 'Bearer $token',
+    },
+  );
+
+  final data = jsonDecode(response.body);
+
+  if (response.statusCode == 200) {
+    return data;
+  }
+
+  throw Exception(data['detail'] ?? 'Could not load nurses');
+}
+
+static Future<void> assignPatient(
+  String token,
+  String patientId,
+  int nurseId,
+) async {
+  final response = await http.put(
+    Uri.parse('$baseUrl/api/patients/$patientId/assign'),
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer $token',
+    },
+    body: jsonEncode({
+      'nurse_id': nurseId,
+    }),
+  );
+
+  if (response.statusCode != 200) {
+    final data = jsonDecode(response.body);
+    throw Exception(data['detail'] ?? 'Could not assign nurse');
+  }
+}
+static Future<Map<String, dynamic>> getPatientMonitoring(
+  String token,
+  String patientId,
+) async {
+  final response = await http.get(
+    Uri.parse(
+      '$baseUrl/api/patients/${Uri.encodeComponent(patientId)}/monitoring',
+    ),
+    headers: {
+      'Authorization': 'Bearer $token',
+    },
+  );
+
+  final data = jsonDecode(response.body);
+
+  if (response.statusCode == 200) {
+    return data;
+  }
+
+  throw Exception(data['detail'] ?? 'Could not load patient monitoring');
+}
+}

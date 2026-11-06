@@ -1,0 +1,336 @@
+
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+import hashlib
+import secrets
+import hmac
+from fastapi import APIRouter, Depends, HTTPException, Header
+from pydantic import BaseModel, Field
+
+from auth import get_current_user, require_role
+
+router = APIRouter(prefix="/api/patients", tags=["Patients"])
+
+DATABASE_PATH = Path(__file__).resolve().parent / "users.db"
+
+
+def get_connection():
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_patient_database():
+    with get_connection() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS patients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                bed_number TEXT NOT NULL,
+                assigned_nurse_id INTEGER,
+                created_at TEXT NOT NULL
+            )
+        """)
+        columns = [
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(patients)"
+            ).fetchall()
+        ]
+
+        if "device_key_hash" not in columns:
+            connection.execute(
+                "ALTER TABLE patients ADD COLUMN device_key_hash TEXT"
+            )
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS iv_readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id TEXT NOT NULL,
+                level_label TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                captured_at TEXT NOT NULL
+            )
+        """)
+
+
+class PatientCreate(BaseModel):
+    patient_id: str = Field(min_length=2, max_length=30)
+    name: str = Field(min_length=2, max_length=100)
+    bed_number: str = Field(min_length=1, max_length=20)
+
+
+@router.post("")
+def create_patient(
+    patient: PatientCreate,
+    current_user: dict = Depends(require_role("admin"))
+):
+    try:
+        with get_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO patients
+                (patient_id, name, bed_number, assigned_nurse_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    patient.patient_id.strip(),
+                    patient.name.strip(),
+                    patient.bed_number.strip(),
+                    None,
+                    datetime.now(timezone.utc).isoformat()
+                )
+            )
+
+        return {"message": "Patient registered successfully."}
+
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=409,
+            detail="Patient ID already exists."
+        )
+
+
+@router.get("")
+def list_patients(current_user: dict = Depends(get_current_user)):
+    with get_connection() as connection:
+        if current_user["role"] == "admin":
+            rows = connection.execute(
+                "SELECT * FROM patients ORDER BY id DESC"
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT * FROM patients
+                WHERE assigned_nurse_id = ?
+                ORDER BY id DESC
+                """,
+                (current_user["id"],)
+            ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+class NurseAssignment(BaseModel):
+    nurse_id: int
+
+class ReadingCreate(BaseModel):
+    level_label: str = Field(
+        pattern="^(100%|80%|50%|Empty)$"
+    )
+    confidence: float = Field(ge=0, le=1)
+
+@router.get("/nurses")
+def list_nurses(
+    current_user: dict = Depends(require_role("admin"))
+):
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, name, email
+            FROM users
+            WHERE role = 'nurse'
+            ORDER BY name
+            """
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+@router.put("/{patient_id}/assign")
+def assign_patient(
+    patient_id: str,
+    assignment: NurseAssignment,
+    current_user: dict = Depends(require_role("admin"))
+):
+    with get_connection() as connection:
+        nurse = connection.execute(
+            "SELECT id FROM users WHERE id = ? AND role = 'nurse'",
+            (assignment.nurse_id,)
+        ).fetchone()
+
+        if nurse is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Nurse not found."
+            )
+
+        result = connection.execute(
+            """
+            UPDATE patients
+            SET assigned_nurse_id = ?
+            WHERE patient_id = ?
+            """,
+            (assignment.nurse_id, patient_id)
+        )
+
+        if result.rowcount == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found."
+            )
+
+    return {"message": "Patient assigned to nurse successfully."}
+
+
+@router.get("/{patient_id}/monitoring")
+def get_patient_monitoring(
+    patient_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    with get_connection() as connection:
+        patient = connection.execute(
+            "SELECT * FROM patients WHERE patient_id = ?",
+            (patient_id,)
+        ).fetchone()
+
+        if patient is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found."
+            )
+
+        if (
+            current_user["role"] == "nurse"
+            and patient["assigned_nurse_id"] != current_user["id"]
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="This patient is not assigned to you."
+            )
+
+        readings = connection.execute(
+            """
+            SELECT id, patient_id, level_label, confidence, captured_at
+            FROM iv_readings
+            WHERE patient_id = ?
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (patient_id,)
+        ).fetchall()
+
+    latest_reading = dict(readings[0]) if readings else None
+
+    device_status = "offline"
+
+    if latest_reading:
+        captured_at = datetime.fromisoformat(
+            latest_reading["captured_at"]
+        )
+
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=timezone.utc)
+
+        if datetime.now(timezone.utc) - captured_at <= timedelta(seconds=15):
+            device_status = "online"
+
+    return {
+        "patient": dict(patient),
+        "device_status": device_status,
+        "latest_reading": latest_reading,
+        "recent_readings": [dict(reading) for reading in readings]
+    }
+
+@router.post("/{patient_id}/device-key")
+def generate_device_key(
+    patient_id: str,
+    current_user: dict = Depends(require_role("admin"))
+):
+    device_key = secrets.token_urlsafe(32)
+    key_hash = hashlib.sha256(
+        device_key.encode()
+    ).hexdigest()
+
+    with get_connection() as connection:
+        result = connection.execute(
+            """
+            UPDATE patients
+            SET device_key_hash = ?
+            WHERE patient_id = ?
+            """,
+            (key_hash, patient_id)
+        )
+
+        if result.rowcount == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found."
+            )
+
+    return {
+        "message": "Device key generated successfully.",
+        "patient_id": patient_id,
+        "device_key": device_key
+    }
+
+
+@router.post("/{patient_id}/readings")
+def receive_reading(
+    patient_id: str,
+    reading: ReadingCreate,
+    x_device_key: str = Header(..., alias="X-Device-Key")
+):
+    with get_connection() as connection:
+        patient = connection.execute(
+            """
+            SELECT patient_id, device_key_hash
+            FROM patients
+            WHERE patient_id = ?
+            """,
+            (patient_id,)
+        ).fetchone()
+
+        if patient is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found."
+            )
+
+        if not patient["device_key_hash"]:
+            raise HTTPException(
+                status_code=403,
+                detail="No device key registered for this patient."
+            )
+
+        received_hash = hashlib.sha256(
+            x_device_key.encode()
+        ).hexdigest()
+
+        if not hmac.compare_digest(
+            received_hash,
+            patient["device_key_hash"]
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid device key."
+            )
+
+        captured_at = datetime.now(timezone.utc).isoformat()
+
+        cursor = connection.execute(
+            """
+            INSERT INTO iv_readings
+            (patient_id, level_label, confidence, captured_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                patient_id,
+                reading.level_label,
+                reading.confidence,
+                captured_at
+            )
+        )
+
+        reading_id = cursor.lastrowid
+
+    return {
+        "message": "IV reading saved successfully.",
+        "reading_id": reading_id,
+        "patient_id": patient_id,
+        "level_label": reading.level_label,
+        "confidence": reading.confidence,
+        "captured_at": captured_at
+    }

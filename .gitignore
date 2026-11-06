@@ -1,0 +1,110 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Environment variables / secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Testing / coverage
+# =========================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# =========================
+# Build / packaging
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# IDE settings
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Datasets
+# =========================
+datasets/
+data/
+
+# =========================
+# Generated results / logs
+# =========================
+results/
+logs/
+*.log
+*.tmp
+*.temp
+
+# =========================
+# Model artifacts
+# Ignore model files by default
+# =========================
+models/*
+*.keras
+*.h5
+*.pt
+*.pth
+*.joblib
+*.pkl
+*.pickle
+
+# Allow the model and labels used by the current dashboard
+!models/
+!models/mobilenetv2_iv.keras
+!models/mobilenetv2_labels.json
+
+# =========================
+# Large downloaded model files
+# =========================
+yolo11n.pt
+
+# =========================
+# Streamlit
+# =========================
+.streamlit/secrets.toml
+
+# =========================
+# Flutter / Dart generated files
+# =========================
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+.flutter/
